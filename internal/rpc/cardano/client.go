@@ -297,17 +297,17 @@ func (c *CardanoClient) FetchTransactionsParallel(
 	err := g.Wait()
 	if err != nil {
 		// Propagate rate-limit style errors upward to trigger failover.
-// FetchTransactionsSelective fetches only transactions that have at least one output to a monitored address.
-			msg := strings.ToLower(err.Error())
-			if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
-				(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {
-				return nil, err
-			}
-			// Otherwise, keep partial results and continue.
-			logger.Warn("fetch transactions parallel completed with error", "error", err)
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
+			(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {
+			return nil, err
 		}
-		return results, nil
+		// Otherwise, keep partial results and continue.
+		logger.Warn("fetch transactions parallel completed with error", "error", err)
 	}
+	return results, nil
+}
+// FetchTransactionsSelective fetches only transactions that have at least one output to a monitored address.
 
 // It first fetches UTXOs to prefilter, then fetches full transaction details only for matched txs.
 func (c *CardanoClient) FetchTransactionsSelective(
@@ -324,10 +324,6 @@ func (c *CardanoClient) FetchTransactionsSelective(
 	}
 
 	// Phase 1: fetch UTXOs for prefiltering
-	type sel struct {
-		hash   string
-		match  bool
-	}
 	selected := make([]string, 0)
 
 	{
@@ -420,16 +416,3 @@ func (c *CardanoClient) FetchTransactionsSelective(
 		return results, nil
 	}
 }
-
-		msg := strings.ToLower(err.Error())
-		if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
-			(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {
-			return nil, err
-		}
-		// Otherwise, keep partial results and continue.
-		logger.Warn("fetch transactions parallel completed with error", "error", err)
-	}
-	return results, nil
-}
-
-

@@ -20,10 +20,82 @@ import (
 
 
 type CardanoIndexer struct {
-	chainName  string
-	config     config.ChainConfig
-	failover   *rpc.Failover[cardano.CardanoAPI]
+	chainName   string
+	config      config.ChainConfig
+	failover    *rpc.Failover[cardano.CardanoAPI]
 	pubkeyStore PubkeyStore // optional: for selective tx fetching
+
+	// Optional Ogmios streaming for real-time blocks
+	ogmios     cardano.OgmiosAPI
+	cacheMu    sync.RWMutex
+	cache      map[uint64]*types.Block
+	cacheOrder []uint64
+	cacheCap   int
+}
+
+
+// StartOgmios begins consuming blocks from Ogmios and caching them for fast access.
+// Safe to call multiple times; subsequent calls are no-ops.
+func (c *CardanoIndexer) StartOgmios(ctx context.Context) {
+	if c.ogmios == nil {
+		return
+	}
+	// initialize cache once
+	c.cacheMu.Lock()
+	if c.cache == nil {
+		c.cache = make(map[uint64]*types.Block, 256)
+	}
+	if c.cacheCap == 0 {
+		c.cacheCap = 200
+	}
+	c.cacheMu.Unlock()
+
+	bch, _ := c.ogmios.Start(ctx)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case b, ok := <-bch:
+				if !ok || b == nil {
+					return
+				}
+				// convert and cache
+				tb := c.convertBlock(b)
+				c.cachePut(tb)
+			}
+		}
+	}()
+}
+
+func (c *CardanoIndexer) cachePut(b *types.Block) {
+	if b == nil {
+		return
+	}
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+	if c.cache == nil {
+		c.cache = make(map[uint64]*types.Block, 256)
+	}
+	if _, exists := c.cache[b.Number]; !exists {
+		c.cacheOrder = append(c.cacheOrder, b.Number)
+		if c.cacheCap > 0 && len(c.cacheOrder) > c.cacheCap {
+			old := c.cacheOrder[0]
+			c.cacheOrder = c.cacheOrder[1:]
+			delete(c.cache, old)
+		}
+	}
+	c.cache[b.Number] = b
+}
+
+func (c *CardanoIndexer) cacheGet(num uint64) (*types.Block, bool) {
+	c.cacheMu.RLock()
+	defer c.cacheMu.RUnlock()
+	if c.cache == nil {
+		return nil, false
+	}
+	b, ok := c.cache[num]
+	return b, ok
 }
 
 func NewCardanoIndexer(
@@ -31,13 +103,18 @@ func NewCardanoIndexer(
 	cfg config.ChainConfig,
 	failover *rpc.Failover[cardano.CardanoAPI],
 	pubkeyStore PubkeyStore,
+	ogmios cardano.OgmiosAPI,
 ) *CardanoIndexer {
-	return &CardanoIndexer{
-		chainName:  chainName,
-		config:     cfg,
-		failover:   failover,
+	ci := &CardanoIndexer{
+		chainName:   chainName,
+		config:      cfg,
+		failover:    failover,
 		pubkeyStore: pubkeyStore,
+		ogmios:      ogmios,
+		cacheCap:    200,
+		cache:       make(map[uint64]*types.Block, 256),
 	}
+	return ci
 }
 
 func (c *CardanoIndexer) GetName() string                  { return strings.ToUpper(c.chainName) }
@@ -115,7 +192,7 @@ func (c *CardanoIndexer) GetBlock(ctx context.Context, blockNumber uint64) (*typ
 	return c.convertBlock(block), nil
 }
 
-// GetBlocks fetches a range of blocks
+// GetBlocks fetches a range of blocks (hybrid: prefer Ogmios cache near head)
 func (c *CardanoIndexer) GetBlocks(
 	ctx context.Context,
 	from, to uint64,

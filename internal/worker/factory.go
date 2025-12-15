@@ -176,7 +176,7 @@ func buildTronIndexer(chainName string, chainCfg config.ChainConfig, mode Worker
 	return indexer.NewTronIndexer(chainName, chainCfg, failover)
 }
 
-// buildCardanoIndexer constructs a Cardano indexer with failover and providers.
+// buildCardanoIndexer constructs a Cardano indexer with hybrid Ogmios (real-time) + REST (historical).
 func buildCardanoIndexer(chainName string, chainCfg config.ChainConfig, mode WorkerMode, pubkeyStore pubkeystore.Store) indexer.Indexer {
 	failover := rpc.NewFailover[cardano.CardanoAPI](nil)
 
@@ -185,7 +185,21 @@ func buildCardanoIndexer(chainName string, chainCfg config.ChainConfig, mode Wor
 		chainName, chainCfg.Throttle.RPS, chainCfg.Throttle.Burst,
 	)
 
+	var ogmiosClient cardano.OgmiosAPI
+	restCount := 0
+
 	for i, node := range chainCfg.Nodes {
+		// Detect Ogmios (ws/wss) nodes
+		if cardano.IsOgmiosURL(node.URL) {
+			headers := map[string]string{}
+			if node.Auth.Key != "" && node.Auth.Value != "" {
+				headers[node.Auth.Key] = node.Auth.Value
+			}
+			ogmiosClient = cardano.NewCardanoOgmiosClient(node.URL, headers)
+			continue
+		}
+
+		// Otherwise treat as REST (Blockfrost or compatible)
 		client := cardano.NewCardanoClient(
 			node.URL,
 			&rpc.AuthConfig{
@@ -205,9 +219,15 @@ func buildCardanoIndexer(chainName string, chainCfg config.ChainConfig, mode Wor
 			Client:     client,
 			State:      rpc.StateHealthy, // Initialize as healthy
 		})
+		restCount++
 	}
 
-	return indexer.NewCardanoIndexer(chainName, chainCfg, failover, pubkeyStore)
+	// Enforce hybrid requirement: must have both Ogmios and at least one REST node
+	if ogmiosClient == nil || restCount == 0 {
+		logger.Fatal("Cardano hybrid requires both Ogmios (wss) and REST providers", "chain", chainName)
+	}
+
+	return indexer.NewCardanoIndexer(chainName, chainCfg, failover, pubkeyStore, ogmiosClient)
 }
 
 // CreateManagerWithWorkers initializes manager and all workers for configured chains.
@@ -245,6 +265,10 @@ func CreateManagerWithWorkers(
 			idxr = buildTronIndexer(chainName, chainCfg, ModeRegular)
 		case enum.NetworkTypeCardano:
 			idxr = buildCardanoIndexer(chainName, chainCfg, ModeRegular, pubkeyStore)
+			// Start Ogmios streaming if available (hybrid real-time)
+			if ci, ok := idxr.(*indexer.CardanoIndexer); ok {
+				ci.StartOgmios(ctx)
+			}
 		default:
 			logger.Fatal("Unsupported network type", "chain", chainName, "type", chainCfg.Type)
 		}

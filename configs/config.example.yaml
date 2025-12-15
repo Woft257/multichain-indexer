@@ -68,18 +68,26 @@ chains:
     start_block: 12768402 # Cardano mainnet block height
     poll_interval: "10s" # Cardano block time is ~20 seconds
     nodes:
+      # Ogmios (Demeter) for real-time streaming (required)
+      - url: "wss://ogmios-mainnet.demeter.run/YOUR_ENDPOINT"
+        auth:
+          type: "header"
+          key: "dmtr-api-key"
+          value: "YOUR_DEMETER_API_KEY" # Get from Demeter
+      # Blockfrost REST for historical/catchup/rescan (required)
       - url: "https://cardano-mainnet.blockfrost.io/api/v0"
         auth:
           type: "header"
           key: "project_id"
-          value: "BLOCKFROST_API_KEY" # Get from https://blockfrost.io/
+          value: "YOUR_BLOCKFROST_API_KEY" # Get from https://blockfrost.io/
     client:
       timeout: "30s"
       max_retries: 3
       retry_delay: "5s"
     throttle:
-      rps: 10 # Blockfrost free tier allows 10 req/s
+      rps: 10 # suggests near free-tier; tune based on your plan
       burst: 20
+      concurrency: 2 # with Ogmios hybrid, keep concurrency modest
 
 # Infrastructure services
 services:
