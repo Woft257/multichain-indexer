@@ -121,8 +121,8 @@ func (c *CardanoClient) GetBlockByHash(ctx context.Context, blockHash string) (*
 		return nil, fmt.Errorf("failed to unmarshal block response: %w", err)
 	}
 
-	// Fetch transactions for this block
-	txHashes, err := c.GetTransactionsByBlock(ctx, blockResp.Height)
+	// Fetch transactions for this block (by hash directly)
+	txHashes, err := c.GetTransactionsByBlockHash(ctx, blockResp.Hash)
 	if err != nil {
 		logger.Warn("failed to fetch transactions for block", "block", blockResp.Height, "error", err)
 		txHashes = []string{}
@@ -151,24 +151,27 @@ func (c *CardanoClient) GetBlockByHash(ctx context.Context, blockHash string) (*
 	}, nil
 }
 
-// GetTransactionsByBlock fetches all transaction hashes in a block
+// GetTransactionsByBlock fetches all transaction hashes in a block by height
 func (c *CardanoClient) GetTransactionsByBlock(ctx context.Context, blockNumber uint64) ([]string, error) {
-	// Resolve block hash from height then request txs by hash
+	// Resolve block hash first, then use hash endpoint
 	hash, err := c.GetBlockHash(ctx, blockNumber)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve block hash: %w", err)
+		return nil, fmt.Errorf("failed to resolve block hash for %d: %w", blockNumber, err)
 	}
-	endpoint := fmt.Sprintf("/blocks/%s/txs", hash)
+	return c.GetTransactionsByBlockHash(ctx, hash)
+}
+
+// GetTransactionsByBlockHash fetches transaction hashes by block hash directly
+func (c *CardanoClient) GetTransactionsByBlockHash(ctx context.Context, blockHash string) ([]string, error) {
+	endpoint := fmt.Sprintf("/blocks/%s/txs", blockHash)
 	data, err := c.Do(ctx, "GET", endpoint, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get transactions for block %d: %w", blockNumber, err)
+		return nil, fmt.Errorf("failed to get transactions for block %s: %w", blockHash, err)
 	}
-
 	var txHashes []string
 	if err := json.Unmarshal(data, &txHashes); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal transactions response: %w", err)
 	}
-
 	return txHashes, nil
 }
 
@@ -186,15 +189,9 @@ func (c *CardanoClient) GetTransaction(ctx context.Context, txHash string) (*Tra
 	}
 
 	// Fetch UTXOs (inputs/outputs)
-	utxoEndpoint := fmt.Sprintf("/txs/%s/utxos", txHash)
-	utxoData, err := c.Do(ctx, "GET", utxoEndpoint, nil, nil)
+	utxos, err := c.GetTransactionUTxOs(ctx, txHash)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get transaction utxos %s: %w", txHash, err)
-	}
-
-	var utxos TxUTxOsResponse
-	if err := json.Unmarshal(utxoData, &utxos); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal tx utxos: %w", err)
+		return nil, err
 	}
 
 	// Convert inputs (multi-asset)
@@ -232,6 +229,20 @@ func (c *CardanoClient) GetTransaction(ctx context.Context, txHash string) (*Tra
 		Fee:           fees,
 		ValidContract: txResp.ValidContract,
 	}, nil
+}
+
+// GetTransactionUTxOs fetches only UTXOs (inputs/outputs) of a tx
+func (c *CardanoClient) GetTransactionUTxOs(ctx context.Context, txHash string) (*TxUTxOsResponse, error) {
+	utxoEndpoint := fmt.Sprintf("/txs/%s/utxos", txHash)
+	utxoData, err := c.Do(ctx, "GET", utxoEndpoint, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction utxos %s: %w", txHash, err)
+	}
+	var utxos TxUTxOsResponse
+	if err := json.Unmarshal(utxoData, &utxos); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tx utxos: %w", err)
+	}
+	return &utxos, nil
 }
 
 // FetchTransactionsParallel fetches transactions concurrently with bounded concurrency
@@ -286,6 +297,130 @@ func (c *CardanoClient) FetchTransactionsParallel(
 	err := g.Wait()
 	if err != nil {
 		// Propagate rate-limit style errors upward to trigger failover.
+// FetchTransactionsSelective fetches only transactions that have at least one output to a monitored address.
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
+				(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {
+				return nil, err
+			}
+			// Otherwise, keep partial results and continue.
+			logger.Warn("fetch transactions parallel completed with error", "error", err)
+		}
+		return results, nil
+	}
+
+// It first fetches UTXOs to prefilter, then fetches full transaction details only for matched txs.
+func (c *CardanoClient) FetchTransactionsSelective(
+	ctx context.Context,
+	txHashes []string,
+	concurrency int,
+	addressChecker func(addr string) bool,
+) ([]Transaction, error) {
+	if concurrency <= 0 {
+		concurrency = DefaultTxFetchConcurrency
+	}
+	if len(txHashes) == 0 {
+		return nil, nil
+	}
+
+	// Phase 1: fetch UTXOs for prefiltering
+	type sel struct {
+		hash   string
+		match  bool
+	}
+	selected := make([]string, 0)
+
+	{
+		var (
+			g, gctx = errgroup.WithContext(ctx)
+			sem     = make(chan struct{}, concurrency)
+			mu      sync.Mutex
+		)
+
+		for _, h := range txHashes {
+			h := h
+			sem <- struct{}{}
+			g.Go(func() error {
+				defer func() { <-sem }()
+				utxos, err := c.GetTransactionUTxOs(gctx, h)
+				if err != nil {
+					// Handle rate-limit style errors explicitly so failover can kick in
+					msg := strings.ToLower(err.Error())
+					if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
+						(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {
+						return err
+					}
+					// Otherwise, skip this tx silently but continue
+					logger.Warn("prefilter utxos failed", "tx_hash", h, "error", err)
+					return nil
+				}
+				// Check outputs for monitored addresses
+				matched := false
+				for _, out := range utxos.Outputs {
+					if out.Address != "" && addressChecker(out.Address) {
+						matched = true
+						break
+					}
+				}
+				if matched {
+					mu.Lock()
+					selected = append(selected, h)
+					mu.Unlock()
+				}
+				return nil
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+	}
+
+	if len(selected) == 0 {
+		return nil, nil
+	}
+
+	// Phase 2: fetch full transactions for selected hashes
+	{
+		var (
+			g, gctx = errgroup.WithContext(ctx)
+			sem     = make(chan struct{}, concurrency)
+			mu      sync.Mutex
+			results = make([]Transaction, 0, len(selected))
+		)
+
+		for _, h := range selected {
+			h := h
+			sem <- struct{}{}
+			g.Go(func() error {
+				defer func() { <-sem }()
+				tx, err := c.GetTransaction(gctx, h)
+				if err != nil {
+					msg := strings.ToLower(err.Error())
+					if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
+						(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {
+						return err
+					}
+					logger.Warn("selective tx fetch failed", "tx_hash", h, "error", err)
+					return nil
+				}
+				if tx != nil {
+					mu.Lock()
+					results = append(results, *tx)
+					mu.Unlock()
+				}
+				return nil
+			})
+		}
+
+		if err := g.Wait(); err != nil {
+			return nil, err
+		}
+
+		return results, nil
+	}
+}
+
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") ||
 			(strings.Contains(msg, "http request failed") && strings.Contains(msg, "context canceled")) {

@@ -177,7 +177,7 @@ func buildTronIndexer(chainName string, chainCfg config.ChainConfig, mode Worker
 }
 
 // buildCardanoIndexer constructs a Cardano indexer with failover and providers.
-func buildCardanoIndexer(chainName string, chainCfg config.ChainConfig, mode WorkerMode) indexer.Indexer {
+func buildCardanoIndexer(chainName string, chainCfg config.ChainConfig, mode WorkerMode, pubkeyStore pubkeystore.Store) indexer.Indexer {
 	failover := rpc.NewFailover[cardano.CardanoAPI](nil)
 
 	// Shared rate limiter for all workers of this chain (global across regular, catchup, etc.)
@@ -207,7 +207,7 @@ func buildCardanoIndexer(chainName string, chainCfg config.ChainConfig, mode Wor
 		})
 	}
 
-	return indexer.NewCardanoIndexer(chainName, chainCfg, failover)
+	return indexer.NewCardanoIndexer(chainName, chainCfg, failover, pubkeyStore)
 }
 
 // CreateManagerWithWorkers initializes manager and all workers for configured chains.
@@ -244,7 +244,7 @@ func CreateManagerWithWorkers(
 		case enum.NetworkTypeTron:
 			idxr = buildTronIndexer(chainName, chainCfg, ModeRegular)
 		case enum.NetworkTypeCardano:
-			idxr = buildCardanoIndexer(chainName, chainCfg, ModeRegular)
+			idxr = buildCardanoIndexer(chainName, chainCfg, ModeRegular, pubkeyStore)
 		default:
 			logger.Fatal("Unsupported network type", "chain", chainName, "type", chainCfg.Type)
 		}

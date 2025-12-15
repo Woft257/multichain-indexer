@@ -20,20 +20,23 @@ import (
 
 
 type CardanoIndexer struct {
-	chainName string
-	config    config.ChainConfig
-	failover  *rpc.Failover[cardano.CardanoAPI]
+	chainName  string
+	config     config.ChainConfig
+	failover   *rpc.Failover[cardano.CardanoAPI]
+	pubkeyStore PubkeyStore // optional: for selective tx fetching
 }
 
 func NewCardanoIndexer(
 	chainName string,
 	cfg config.ChainConfig,
 	failover *rpc.Failover[cardano.CardanoAPI],
+	pubkeyStore PubkeyStore,
 ) *CardanoIndexer {
 	return &CardanoIndexer{
-		chainName: chainName,
-		config:    cfg,
-		failover:  failover,
+		chainName:  chainName,
+		config:     cfg,
+		failover:   failover,
+		pubkeyStore: pubkeyStore,
 	}
 }
 
@@ -71,7 +74,8 @@ func (c *CardanoIndexer) GetBlock(ctx context.Context, blockNumber uint64) (*typ
 		if err != nil {
 			return err
 		}
-		txHashes, err = api.GetTransactionsByBlock(ctx, blockNumber)
+		// Use header.Hash to avoid extra header lookup in tx listing
+		txHashes, err = api.GetTransactionsByBlockHash(ctx, header.Hash)
 		if err != nil {
 			return err
 		}
@@ -82,6 +86,12 @@ func (c *CardanoIndexer) GetBlock(ctx context.Context, blockNumber uint64) (*typ
 		// Clamp concurrency to the number of transactions to avoid creating useless goroutines
 		if numTxs := len(txHashes); numTxs > 0 && numTxs < concurrency {
 			concurrency = numTxs
+		}
+		// If pubkeyStore is available, do selective fetching to reduce quota usage
+		if c.pubkeyStore != nil {
+			checker := func(addr string) bool { return c.pubkeyStore.Exist(enum.NetworkTypeCardano, addr) }
+			txs, err = api.FetchTransactionsSelective(ctx, txHashes, concurrency, checker)
+			return err
 		}
 		txs, err = api.FetchTransactionsParallel(ctx, txHashes, concurrency)
 		return err
